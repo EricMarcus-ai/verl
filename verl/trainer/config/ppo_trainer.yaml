@@ -325,6 +325,10 @@ trainer:
   # Accelerator type for Ray resource allocation (optional)
   accelerator_type: null
 
+  # whether to use legacy worker implementation
+  #  mode: "auto", "enable", or "disable"
+  use_legacy_worker_impl: auto
+
 # configs related to ray initialization
 ray_init:
 
