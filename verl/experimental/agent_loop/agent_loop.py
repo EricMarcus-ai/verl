@@ -231,11 +231,13 @@ class AgentLoopWorker:
                 self.tokenizer.chat_template = custom_chat_template
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
+        print(f"agent loop config path: {agent_loop_config_path}")
         if agent_loop_config_path:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
 
+        print(f"Current registry: {_agent_loop_registry}")
         trace_config = config.trainer.get("rollout_trace", {})
         trace_config = self.config.actor_rollout_ref.rollout.get("trace", {})
         RolloutTraceConfig.init(
@@ -280,6 +282,7 @@ class AgentLoopWorker:
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
+            print(f"Agent name not found in batch: {batch.non_tensor_batch}")
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
 
         tasks = []
@@ -329,6 +332,7 @@ class AgentLoopWorker:
             validate=trajectory["validate"],
             name="agent_loop",
         ):
+            print(f"running agent loop with agent name {agent_name}")
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
