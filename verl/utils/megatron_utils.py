@@ -39,6 +39,8 @@ from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
 
+from verl.utils.logger import print_rank_0
+
 
 def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
@@ -219,16 +221,25 @@ def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerC
 
 
 def init_megatron_optim_config(optim_config: dict) -> OptimizerConfig:
-    config = OptimizerConfig(
-        optimizer=optim_config.get("optimizer", "adam"),
-        lr=optim_config.get("lr"),
-        min_lr=optim_config.get("min_lr", None),
-        clip_grad=optim_config.get("clip_grad", 1.0),
-        weight_decay=optim_config.get("weight_decay", 0.01),
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        use_distributed_optimizer=True,
-    )
+    optim_args = {
+        "optimizer": optim_config.get("optimizer", "adam"),
+        "lr": optim_config.get("lr"),
+        "min_lr": optim_config.get("min_lr", None),
+        "clip_grad": optim_config.get("clip_grad", 1.0),
+        "weight_decay": optim_config.get("weight_decay", 0.01),
+        "bf16": True,
+        "params_dtype": torch.bfloat16,
+        "use_distributed_optimizer": True,
+    }
+
+    override_config = optim_config.get("override_optimizer_config", {})
+    if override_config:
+        for k, v in override_config.items():
+            optim_args[k] = v
+
+    print_rank_0(f"optimizer config after override: {optim_args}")
+
+    config = OptimizerConfig(**optim_args)
     return config
 
 
