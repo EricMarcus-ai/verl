@@ -299,44 +299,43 @@ class RewardManagerWorker:
         reward_extra_info = {k: v[0] for k, v in result.get("reward_extra_info", {}).items()}
         return {"reward_score": reward_score, "reward_extra_info": reward_extra_info}
 
-
 @ray.remote
 class AgentLoopWorker:
-    """Agent loop worker takes a batch of messages and run each message in an agent loop."""
+    """Agent loop worker (vLLM-only inference).
+    - Uses a single chat template across tokenizer/processor.
+    - No multimodal RoPE/index recomputation on the client; vLLM handles it.
+    - Keeps useful QoL: per-item fanout, optional logprobs, trace init, clean postprocess.
+    """
 
     def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle]):
-        """Initialize agent loop manager.
-
-        Args:
-            config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
-        """
         self.config = config
         self.server_manager = AsyncLLMServerManager(config, server_handles)
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
+
+        # Hugging Face artifacts
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
 
+        # Register agent loop configs
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 _agent_loop_registry[agent_loop_config.name] = agent_loop_config
-        if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
+
+        # Unify chat template across processor & tokenizer (critical for vLLM parity)
+        custom_chat_template = self.config.actor_rollout_ref.model.get("custom_chat_template", None)
+        if custom_chat_template is not None:
             if self.processor is not None:
-                self.processor.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
-            self.tokenizer.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
+                self.processor.chat_template = custom_chat_template
+                # if getattr(self.processor, "tokenizer", None) is not None:
+                    # self.processor.tokenizer.chat_template = custom_chat_template
+            self.tokenizer.chat_template = custom_chat_template
 
-        self.reward_manager_worker = RewardManagerWorker.options(
-            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                node_id=ray.get_runtime_context().get_node_id(),
-                soft=False,
-            ),
-        ).remote(self.config, local_path)
-
+        # Tracing
         trace_config = self.config.actor_rollout_ref.rollout.get("trace", {})
         RolloutTraceConfig.init(
             self.config.trainer.project_name,
@@ -346,60 +345,41 @@ class AgentLoopWorker:
         )
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
-        """Generate sequences from agent loop.
-
-        Args:
-            batch (DataProto): Input batch.
-
-        Returns:
-            DataProto: Output batch.
-            - prompts: [bsz, prompt_length], prompt token ids from dataset.
-            - responses: [bsz, response_length], output token ids include response tokens
-              from LLM generation and observation tokens from tool_calls.
-            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
-            - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
-              and response tokens.
-            - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
-            - position_ids: [bsz, prompt_length + response_length], incremental position ids.
-
-            For multi-turn conversations:
-            responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
-            response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
-        """
-        config = self.config.actor_rollout_ref.rollout
+        """Generate sequences from agent loops, collate to DataProto."""
+        cfg = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
-            temperature=config.temperature,
-            top_p=config.top_p,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
+            logprobs=cfg.calculate_log_probs,  # vLLM can return token logprobs
         )
 
-        # override sampling params for validation
+        # Validation overrides
         if batch.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["top_p"] = cfg.val_kwargs.top_p
+            sampling_params["temperature"] = cfg.val_kwargs.temperature
 
-        # by default, we assume it's a single turn agent
+        # Ensure agent_name exists
         if "agent_name" not in batch.non_tensor_batch:
             batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(batch), dtype=object)
 
+        # Trajectory info
         if "index" in batch.non_tensor_batch:
             index = batch.non_tensor_batch["index"]
         else:
             index = np.arange(len(batch))
-
         trajectory_info = await get_trajectory_info(
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        # Fan out one task per sample (preserves per-item kwargs)
         tasks = []
         for i in range(len(batch)):
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs)
-        return output
+        return self._postprocess(outputs)
 
     async def _run_agent_loop(
         self,
@@ -408,7 +388,8 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ):
+        """Instantiate configured agent loop and run it. vLLM does all inference."""
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -417,7 +398,7 @@ class AgentLoopWorker:
             name="agent_loop",
         ):
             assert agent_name in _agent_loop_registry, (
-                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+                f"Agent loop {agent_name} not registered, registered: {_agent_loop_registry.keys()}"
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
@@ -428,190 +409,108 @@ class AgentLoopWorker:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
 
-            # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
-            if output.reward_score is None and not self.config.reward_model.enable:
-                result = await self.reward_manager_worker.compute_score.remote(output, kwargs)
-                output.reward_score = result["reward_score"]
-                output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+            # Runs end-to-end (tool calls + vLLM generation); returns AgentLoopOutput
+            output = await agent_loop.run(sampling_params, **kwargs)
 
-            # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
-            # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
-            # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
-            # input_ids: concatenation of prompt + response
-            # Mask:
-            # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
-            # - prompt_attention_mask: 0s for padding, 1s for tokens
-            #   e.g., [0,0,0,0,1,1,1,1]
-            # - response_attention_mask: 0s for padding, 1s for tokens
-            #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
-            # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
-            #   e.g., [0,0,0,0,1,1,1,1(prompt),1,1,1,1,1,1,1,1,1,1,1,0,0,0,0(response)]
-            # - response_mask: 1s for LLM generated tokens, 0 for tool response/padding tokens
-            #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
-            # - position_ids: sequential positions for tokens, starting at 0
-            #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
+            # Return raw AgentLoopOutput; padding is handled centrally in _postprocess
+            return output
 
-            self.tokenizer.padding_side = "left"
-            prompt_output = self.tokenizer.pad(
-                {"input_ids": output.prompt_ids},
-                padding="max_length",
-                max_length=self.config.actor_rollout_ref.rollout.prompt_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            if prompt_output["input_ids"].dim() == 1:
-                prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-                prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+    def _postprocess(self, inputs: list) -> DataProto:
+        """Pad/stack outputs. position_ids are simple 1-D cumsum (vLLM ignores them during gen)."""
+        # prompts (left pad)
+        self.tokenizer.padding_side = "left"
+        outs = self.tokenizer.pad(
+            [{"input_ids": x.prompt_ids} for x in inputs],
+            padding="max_length",
+            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        prompt_ids, prompt_mask = outs["input_ids"], outs["attention_mask"]
 
-            self.tokenizer.padding_side = "right"
-            response_output = self.tokenizer.pad(
-                {"input_ids": output.response_ids},
-                padding="max_length",
-                max_length=self.config.actor_rollout_ref.rollout.response_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            if response_output["input_ids"].dim() == 1:
-                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+        # responses (right pad)
+        self.tokenizer.padding_side = "right"
+        outs = self.tokenizer.pad(
+            [{"input_ids": x.response_ids} for x in inputs],
+            padding="max_length",
+            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        response_ids, response_attn_mask = outs["input_ids"], outs["attention_mask"]
 
-            response_mask_output = self.tokenizer.pad(
-                {"input_ids": output.response_mask},
-                padding="max_length",
-                max_length=self.config.actor_rollout_ref.rollout.response_length,
-                return_tensors="pt",
-                return_attention_mask=False,
-            )
-            if response_mask_output["input_ids"].dim() == 1:
-                response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+        # response_mask (right pad): 1 for model tokens, 0 for tool/obs/pad
+        outs = self.tokenizer.pad(
+            [{"input_ids": x.response_mask} for x in inputs],
+            padding="max_length",
+            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            return_tensors="pt",
+            return_attention_mask=False,
+        )
+        response_mask = outs["input_ids"]
+        assert response_ids.shape == response_mask.shape, \
+            f"mismatch in response_ids and response_mask: {response_ids.shape} vs {response_mask.shape}"
+        response_mask = response_mask * response_attn_mask
 
-            response_logprobs = None
-            if output.response_logprobs is not None:
-                pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
-                response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+        # concat
+        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, response_attn_mask], dim=1)
 
-            response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
-            attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
-            input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+        # simple 1-D position ids (for exports/analysis only)
+        position_ids = (attention_mask.cumsum(dim=1) - 1) * attention_mask
 
-            # Handle multi-modal inputs and position_ids calculation
-            # Only support Qwen2VLImageProcessor for multi-modal processing currently
-            # TODO: support other multi-modal inputs
-            multi_modal_inputs = None
-            if (
-                self.processor is not None
-                and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
-            ):
-                from verl.models.transformers.qwen2_vl import get_rope_index
-
-                images = output.multi_modal_data.get("image", None)
-                current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-                multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
-                multi_modal_inputs.pop("input_ids", None)
-                multi_modal_inputs.pop("attention_mask", None)
-
-                # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-                # because np.array() only keeps the keys for BatchFeature.
-                multi_modal_inputs = dict(multi_modal_inputs)
-
-                image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-                video_grid_thw = multi_modal_inputs.get("video_grid_thw")
-                second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
-
-                position_ids = get_rope_index(
-                    self.processor,
-                    input_ids=input_ids.squeeze(0),
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    second_per_grid_ts=second_per_grid_ts,
-                    attention_mask=attention_mask.squeeze(0),
-                ).unsqueeze(0)  # (1, 3, seq_len)
-            else:
-                position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
-
-            return _InternalAgentLoopOutput(
-                prompt_ids=prompt_output["input_ids"],
-                response_ids=response_output["input_ids"],
-                input_ids=input_ids,
-                position_ids=position_ids,
-                response_mask=response_mask,
-                attention_mask=attention_mask,
-                response_logprobs=response_logprobs,
-                multi_modal_inputs=multi_modal_inputs,
-                multi_modal_data=output.multi_modal_data,
-                reward_score=output.reward_score,
-                num_turns=output.num_turns,
-                metrics=output.metrics,
-                extra_fields=output.extra_fields,
-            )
-
-    def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
-        """Process the padded outputs from _run_agent_loop and combine them into a batch."""
-        # Convert lists back to tensors and stack them to create a batch.
-        prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
-        response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
-        response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
-        attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
-        input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
-        position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
-        optional_outputs = {}
-        if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        # optional rollout logprobs if any sample provided them
+        optional = {}
+        if inputs and getattr(inputs[0], "response_logprobs", None) is not None:
+            # right-pad to response_length per-sample if not already padded
+            padded_logs = []
+            tgt_len = self.config.actor_rollout_ref.rollout.response_length
+            for x in inputs:
+                logs = x.response_logprobs or []
+                pad = [0.0] * max(0, tgt_len - len(logs))
+                padded_logs.append(torch.tensor(logs + pad).unsqueeze(0))
+            optional["rollout_log_probs"] = torch.cat(padded_logs, dim=0)
 
         batch = TensorDict(
             {
-                "prompts": prompt_ids,  # [bsz, prompt_length]
-                "responses": response_ids,  # [bsz, response_length]
-                "response_mask": response_mask,  # [bsz, response_length]
-                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
-                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
-                # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
-                "position_ids": position_ids,
-                **optional_outputs,
+                "prompts": prompt_ids,          # [bsz, prompt_length]
+                "responses": response_ids,      # [bsz, response_length]
+                "response_mask": response_mask, # [bsz, response_length]
+                "input_ids": input_ids,         # [bsz, prompt_length + response_length]
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,   # [bsz, prompt_length + response_length]
+                **optional,
             },
             batch_size=len(inputs),
         )
 
-        scores = [input.reward_score for input in inputs]
-        if all(score is not None for score in scores):
-            prompt_length = prompt_ids.size(1)
-            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
+        # reward scores mapped to last real response token per sample (if provided upstream)
+        scores = [getattr(x, "reward_score", None) for x in inputs]
+        if scores and all(s is not None for s in scores):
+            prompt_len = prompt_ids.size(1)
+            last_resp_idx = attention_mask[:, prompt_len:].sum(dim=1) - 1
             rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+            rm_scores[torch.arange(response_mask.size(0)), last_resp_idx] = torch.tensor(scores, dtype=torch.float32)
             batch["rm_scores"] = rm_scores
 
-        non_tensor_batch = {
-            "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
+        # non-tensor batch (turn counts, metrics, and any extra_fields)
+        non_tensor = {
+            "__num_turns__": np.array([getattr(x, "num_turns", 1) for x in inputs], dtype=np.int32),
         }
+        metrics = [x.metrics.model_dump() for x in inputs]
+        # flatten extra_fields into arrays
+        all_extra_keys = set(k for x in inputs for k in getattr(x, "extra_fields", {}))
+        for k in all_extra_keys:
+            non_tensor[k] = np.array([x.extra_fields.get(k) for x in inputs], dtype=object)
 
-        # add reward_extra_info to non_tensor_batch
-        reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-
-        # Add multi_modal_inputs to non_tensor_batch if any samples have them
-        multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
-        if any(mmi is not None for mmi in multi_modal_inputs_list):
-            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
-
-        metrics = [input.metrics.model_dump() for input in inputs]
-        # Collect extra fields from all inputs and convert them to np.ndarray
-        extra_fields = {}
-        all_keys = set(key for input_item in inputs for key in input_item.extra_fields)
-        for key in all_keys:
-            extra_fields[key] = np.array([input.extra_fields.get(key) for input in inputs], dtype=object)
-
-        non_tensor_batch.update(extra_fields)
         return DataProto(
             batch=batch,
-            non_tensor_batch=non_tensor_batch,
-            meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
+            non_tensor_batch=non_tensor,
+            meta_info={"metrics": metrics, "reward_extra_keys": []},
         )
 
-
+    
 async def get_trajectory_info(step, index, validate):
     """Get trajectory info.
 
