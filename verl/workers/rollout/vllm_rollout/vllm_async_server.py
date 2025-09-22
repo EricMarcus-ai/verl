@@ -38,6 +38,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 from verl.third_party.vllm import VLLM_SLEEP_LEVEL
 from verl.utils import hf_processor
 from verl.utils.fs import copy_to_local
+from verl.utils.import_utils import import_external_libs
 from verl.workers.rollout.async_server import AsyncServerBase, TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -213,6 +214,7 @@ class AsyncvLLMServer(AsyncServerBase):
     async def init_engine(self):
         """Init vLLM AsyncLLM engine."""
         config = self.config
+        import_external_libs(self.config.model.get("external_lib", None))
         model_path = config.model.path
         model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(model_path)
