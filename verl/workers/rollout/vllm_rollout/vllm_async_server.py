@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 import ray
 import zmq
+import json
 from omegaconf import DictConfig, ListConfig
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -83,6 +84,13 @@ def _get_model_runner_workers(vllm_config, init_ray: bool = True):
     return workers
 
 
+def _worker_side_import_external_libs(libs: list[str]) -> bool:
+    from verl.utils.import_utils import import_external_libs
+    if libs:
+        import_external_libs(libs)
+    return True
+
+
 class ExternalRayDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
 
@@ -90,6 +98,9 @@ class ExternalRayDistributedExecutor(Executor):
 
     def _init_executor(self) -> None:
         self.workers = _get_model_runner_workers(vllm_config=self.vllm_config, init_ray=True)
+        libs = json.loads(os.environ.get("KAIKO_EXTERNAL_LIBS", "[]"))
+        if libs:
+            import_external_libs(libs)
 
         kwargs = dict(
             vllm_config=self.vllm_config,
@@ -99,6 +110,7 @@ class ExternalRayDistributedExecutor(Executor):
             is_driver_worker=True,
         )
         self.collective_rpc("init_worker", args=([kwargs],))
+        self.collective_rpc(_worker_side_import_external_libs, kwargs={"libs": libs})
         self.collective_rpc("init_device")
         self.collective_rpc("load_model")
         print(f"instance_id: {self.vllm_config.instance_id} initializes finished.")
@@ -134,6 +146,9 @@ class ExternalZeroMQDistributedExecutor(Executor):
 
     def _init_executor(self) -> None:
         addresses = os.environ["VERL_VLLM_ZMQ_ADDRESSES"].split(",")
+        libs = json.loads(os.environ.get("KAIKO_EXTERNAL_LIBS", "[]"))
+        if libs:
+            import_external_libs(libs)
         self.context = zmq.Context()
         self.sockets = []
         for address in addresses:
@@ -149,6 +164,7 @@ class ExternalZeroMQDistributedExecutor(Executor):
             is_driver_worker=True,
         )
         self.collective_rpc("init_worker", args=([kwargs],))
+        self.collective_rpc(_worker_side_import_external_libs, kwargs={"libs": libs})
         self.collective_rpc("init_device")
         self.collective_rpc("load_model")
 
@@ -214,7 +230,11 @@ class AsyncvLLMServer(AsyncServerBase):
     async def init_engine(self):
         """Init vLLM AsyncLLM engine."""
         config = self.config
-        import_external_libs(self.config.model.get("external_lib", None))
+        ext_libs = self.config.model.get("external_lib", [])
+        if isinstance(ext_libs, ListConfig):
+            ext_libs = list(ext_libs)
+        import_external_libs(ext_libs)
+        os.environ["KAIKO_EXTERNAL_LIBS"] = json.dumps(ext_libs)
         model_path = config.model.path
         model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(model_path)
