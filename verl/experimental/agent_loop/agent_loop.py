@@ -316,7 +316,7 @@ class AgentLoopWorker:
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
 
-        ext_libs = config.model.get("external_lib", [])
+        ext_libs = config.actor_rollout_ref.model.get("external_lib", [])
         import_external_libs(ext_libs)
 
         # Hugging Face artifacts
