@@ -84,7 +84,7 @@ def _get_model_runner_workers(vllm_config, init_ray: bool = True):
     return workers
 
 
-def _worker_side_import_external_libs(libs: list[str]) -> bool:
+def _worker_side_import_external_libs(worker, libs: list[str]) -> bool:
     from verl.utils.import_utils import import_external_libs
     if libs:
         import_external_libs(libs)
