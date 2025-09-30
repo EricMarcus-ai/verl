@@ -34,6 +34,7 @@ from verl.single_controller.ray.base import RayWorkerGroup
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
+from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.async_server import TokenOutput, async_server_class
@@ -314,6 +315,9 @@ class AgentLoopWorker:
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
+
+        ext_libs = config.model.get("external_lib", [])
+        import_external_libs(ext_libs)
 
         # Hugging Face artifacts
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
